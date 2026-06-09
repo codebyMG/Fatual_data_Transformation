@@ -2,21 +2,32 @@
 ================================================================================
 MSCI Annual Update Factual Process Automation  —  Streamlit Web App
 ================================================================================
-Version     : 3.0.0 (Streamlit)
-Based on    : annual_update_processor v2.0.0 (command-line)
-Changes vs the CLI version:
-              - All file system discovery removed. CSV, DVV and template files
-                are now UPLOADED through the browser.
-              - Issuer ID is no longer typed in. It is read automatically from
-                the DMX_ISSUER_ID column of the uploaded extraction CSV.
-                * If the CSV contains one issuer  -> that issuer is processed.
-                * If it contains several issuers   -> each is processed and all
-                  outputs are bundled together.
-              - All inputs/outputs are handled in memory (BytesIO). Nothing is
-                written to disk. Results are returned as a downloadable ZIP.
-              - Logging is captured to an in-memory buffer and shown in the UI.
-Core data logic (header standardisation, template population, DVV overrides,
-validation, formatting) is preserved unchanged from v2.0.0.
+Version     : 5.0.0 (Streamlit)
+Based on    : annual_update_processor v5.0.0 (command-line)
+
+What this app does
+  Upload the extraction CSV and the DVV merged file, press Run, and download
+  the populated bulk-upload templates as a ZIP.
+
+Key v5 behaviour (preserved from the command-line script)
+  - THREE fixed templates. Scalar and Series 1 are combined into one file.
+  - The scalar (issuer-level) sheet is detected by SHEET NAME ("Scalar"),
+    not by file. Every other sheet is series-level (one row per CSV row).
+  - No openpyxl Table objects. AutoFilter is used instead (Excel Tables made
+    openpyxl emit orphaned table XML, triggering the "We found a problem"
+    repair dialog). AutoFilter gives the same column dropdown / sort UX.
+  - The output contains ONLY the three populated template files.
+
+Web-app specifics
+  - Templates are FIXED: bundled with the app (committed to the repo's
+    'templates/' folder) and loaded automatically. Only CSV + DVV are uploaded.
+  - Issuer ID is read automatically from the DMX_ISSUER_ID column of the CSV.
+    One issuer  -> processed on its own.  Several issuers -> each processed and
+    all outputs bundled together (per-issuer subfolders inside the ZIP).
+  - Everything is handled in memory (BytesIO); nothing is written to disk.
+  - Validation issues and the DVV audit trail are shown on-screen and offered
+    as optional CSV downloads (they are intentionally NOT inside the ZIP, to
+    match v5's "three files only" output).
 Requirements: streamlit | pandas | openpyxl
 ================================================================================
 """
@@ -27,6 +38,7 @@ import zipfile
 import logging
 import datetime
 import traceback
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -34,31 +46,47 @@ import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
+# Table / TableStyleInfo intentionally NOT imported — see module docstring.
 
 
 # ==============================================================================
 # SECTION 1: CONFIGURATION
-# Only the data-shaping constants remain. All folder paths are gone because
-# files now arrive as uploads.
+# Templates are FIXED: bundled with the app (committed to the repo) and loaded
+# automatically. Only the CSV and DVV are uploaded per run.
 # ==============================================================================
 
 CONFIG = {
-    # UI slot label -> internal template key. Each slot is optional.
-    "TEMPLATE_SLOTS": {
-        "Position":  "Position",
-        "Scaler":    "Scaler",
-        "Series 1":  "Series1",
-        "Series 2":  "Series2",
+    # Folder (relative to this script) holding the fixed template files.
+    "TEMPLATE_DIR": "templates",
+
+    # Fixed templates: internal key -> filename inside TEMPLATE_DIR.
+    # Commit these three files to the repo's 'templates/' folder with these
+    # exact names. Scalar and Series 1 are combined in one file.
+    "TEMPLATE_FILES": {
+        "Position":       "Position_Tab_Split.xlsx",
+        "Scalar_Series1": "Scalar_Series1_DP.xlsx",
+        "Series2":        "Series2_DP.xlsx",
+    },
+
+    # Display labels for the status panel.
+    "TEMPLATE_LABELS": {
+        "Position":       "Position",
+        "Scalar_Series1": "Scalar & Series 1",
+        "Series2":        "Series 2",
     },
 
     # Output file-name suffixes per template key.
+    # Output files are named:  IssuerID_<suffix>.xlsx
+    # These keep the names the downstream bulk-upload process expects.
     "OUTPUT_NAMES": {
-        "Position": "Position_Tab_Split",
-        "Scaler":   "Scaler_DP",
-        "Series1":  "Series1_DP",
-        "Series2":  "Series2_DP",
+        "Position":       "Position_Tab_Split",
+        "Scalar_Series1": "Scalar & Series 1_DP",
+        "Series2":        "Series 2- Delete blank cell_DP",
     },
+
+    # Name of the scalar (issuer-level) sheet inside the combined file.
+    # All other sheets in any template are treated as series-level.
+    "SCALAR_SHEET_NAME": "Scalar",
 
     # DVV column letters (Excel column letters in the DVV merged file).
     "DVV_DATALIB_COL":    "F",   # Column F  -> Data Lib
@@ -79,9 +107,6 @@ CONFIG = {
     "DATA_FONT_NAME":      "Times New Roman",
     "DATA_FONT_SIZE":      12,
     "DVV_HIGHLIGHT_COLOR": "E6FDCF",   # Light green for DVV-updated cells
-
-    # Excel table style.
-    "TABLE_STYLE": "TableStyleMedium2",
 }
 
 
@@ -103,6 +128,32 @@ def setup_logging() -> tuple[logging.Logger, io.StringIO]:
     logger.addHandler(handler)
     logger.propagate = False
     return logger, log_buffer
+
+
+def _template_dir() -> Path:
+    """Absolute path to the bundled templates folder, relative to this file."""
+    return Path(__file__).resolve().parent / CONFIG["TEMPLATE_DIR"]
+
+
+def load_fixed_templates(logger: logging.Logger) -> tuple[dict[str, bytes], list[str]]:
+    """
+    Load the fixed template files bundled with the app.
+    Returns (templates_bytes_by_key, list_of_missing_keys).
+    """
+    tmpl_dir = _template_dir()
+    templates: dict[str, bytes] = {}
+    missing: list[str] = []
+
+    for key, filename in CONFIG["TEMPLATE_FILES"].items():
+        path = tmpl_dir / filename
+        if path.exists():
+            templates[key] = path.read_bytes()
+            logger.info(f"Loaded fixed template '{key}': {filename}")
+        else:
+            missing.append(key)
+            logger.warning(f"Fixed template '{key}' not found: {path}")
+
+    return templates, missing
 
 
 # ==============================================================================
@@ -285,16 +336,20 @@ def populate_template(
     """
     Populate all sheets in a template workbook from the extraction DataFrame.
 
-    Scaler      -> one issuer-level row (no Series ID, no blank-row check).
-    Position /  -> one output row per extraction row. Series ID from Col E.
-    Series 1/2     Rows where all template data fields are blank are skipped.
+    Scalar sheet (sheet named CONFIG["SCALAR_SHEET_NAME"]):
+        one issuer-level row, no Series ID, no blank-row check.
+    Every other sheet:
+        one output row per extraction row, Series ID from Column E,
+        rows where all template data fields are blank are skipped.
+
+    The scalar sheet is detected by NAME, so it works whether it lives in its
+    own file or is combined with series sheets (the Scalar & Series 1 file).
 
     Matching: exact Data Lib match only. Unmatched headers -> blank + logged.
     """
     logger.info(f"Populating '{template_key}'")
     wb = load_workbook(io.BytesIO(template_bytes))
     sheet_meta: dict = {}
-    is_scalar = (template_key == "Scaler")
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -309,6 +364,9 @@ def populate_template(
             for col_idx, cell in enumerate(ws[1], start=1)
             if cell.value is not None
         }
+
+        # Scalar sheet detected by name (works in combined files).
+        is_scalar = (sheet_name == CONFIG["SCALAR_SHEET_NAME"])
 
         data_start_row = 2
         populated_rows = 0
@@ -395,7 +453,8 @@ def apply_dvv_overrides(
 ) -> list[dict]:
     """
     Apply DVV Correct Value overrides to the populated workbook.
-    Scalar -> match on Data Lib. Others -> match on Series ID + Data Lib.
+    Scalar sheet -> match on Data Lib. Other sheets -> match on Series ID +
+    Data Lib. The scalar sheet is detected by NAME (per-sheet).
     Updated cells highlighted with DVV_HIGHLIGHT_COLOR. Returns audit records.
     """
     dvv_fill = PatternFill(
@@ -403,7 +462,6 @@ def apply_dvv_overrides(
         start_color=CONFIG["DVV_HIGHLIGHT_COLOR"],
         end_color=CONFIG["DVV_HIGHLIGHT_COLOR"],
     )
-    is_scalar  = (template_key == "Scaler")
     audit_recs: list[dict] = []
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -416,6 +474,7 @@ def apply_dvv_overrides(
         header_col_map = meta["header_col_map"]
         data_start_row = meta["data_start_row"]
         populated_rows = meta["populated_rows"]
+        is_scalar      = (sheet_name == CONFIG["SCALAR_SHEET_NAME"])
 
         row_series_map: dict[int, str | None] = {}
         if "serial_id" in header_col_map:
@@ -501,7 +560,7 @@ def apply_dvv_overrides(
 
 
 # ==============================================================================
-# SECTION 7: OUTPUT FORMATTING
+# SECTION 7: OUTPUT FORMATTING  (AutoFilter only — no Table objects)
 # ==============================================================================
 
 def _thin_border() -> Border:
@@ -532,11 +591,16 @@ def format_worksheet(
     ws,
     data_start_row: int,
     populated_rows: int,
-    table_suffix: str,
     logger: logging.Logger,
 ) -> None:
-    """Header styling, data borders, auto filter, freeze, auto-fit, Excel table.
-    DVV green highlights are preserved (data loop sets font/border only)."""
+    """
+    Header styling, data borders, AutoFilter, freeze top row, auto-fit columns.
+    DVV green highlights are preserved (the data loop sets font/border only).
+
+    AutoFilter is used instead of Excel Table objects: openpyxl emits orphaned
+    table XML that Excel must repair on open ("We found a problem"). AutoFilter
+    gives the same column dropdown / sort UX with zero corruption risk.
+    """
     max_col = ws.max_column
     if not max_col:
         return
@@ -547,6 +611,7 @@ def format_worksheet(
 
     border = _thin_border()
 
+    # Header row
     for c in range(1, max_col + 1):
         cell = ws.cell(row=1, column=c)
         if cell.value is not None:
@@ -555,15 +620,17 @@ def format_worksheet(
             cell.alignment = _center()
             cell.border    = border
 
+    # Data rows (preserve DVV highlight: set font + border only)
     for r in range(data_start_row, last_row + 1):
         for c in range(1, max_col + 1):
             cell = ws.cell(row=r, column=c)
             cell.font   = _dat_font()
             cell.border = border
 
-    ws.auto_filter.ref = f"A1:{get_column_letter(max_col)}1"
+    # Freeze top row
     ws.freeze_panes = "A2"
 
+    # Auto-fit column widths
     for col_cells in ws.columns:
         col_letter = get_column_letter(col_cells[0].column)
         max_len = max(
@@ -571,25 +638,15 @@ def format_worksheet(
         )
         ws.column_dimensions[col_letter].width = min(max_len + 4, 60)
 
+    # AutoFilter over the full data range (replaces Excel Table objects).
+    filter_ref = f"A1:{get_column_letter(max_col)}1"
     if populated_rows > 0:
-        safe_sheet  = re.sub(r"[^A-Za-z0-9_]", "_", ws.title)
-        safe_suffix = re.sub(r"[^A-Za-z0-9_]", "_", table_suffix)
-        tbl_name    = f"Tbl_{safe_suffix}_{safe_sheet}"[:255]
-        tbl_ref     = f"A1:{get_column_letter(max_col)}{last_row}"
-        try:
-            tbl = Table(displayName=tbl_name, ref=tbl_ref)
-            tbl.tableStyleInfo = TableStyleInfo(
-                name=CONFIG["TABLE_STYLE"],
-                showFirstColumn=False, showLastColumn=False,
-                showRowStripes=True, showColumnStripes=False,
-            )
-            ws.add_table(tbl)
-        except Exception as e:
-            logger.warning(f"Could not create Excel table in '{ws.title}': {e}")
+        filter_ref = f"A1:{get_column_letter(max_col)}{last_row}"
+    ws.auto_filter.ref = filter_ref
 
 
 # ==============================================================================
-# SECTION 8: VALIDATION LOG
+# SECTION 8: VALIDATION (in memory — surfaced in the UI, not written to files)
 # ==============================================================================
 
 def build_validation_log(
@@ -631,60 +688,6 @@ def build_validation_log(
     return records
 
 
-def _write_log_sheet(
-    wb: openpyxl.Workbook,
-    sheet_name: str,
-    columns: list[str],
-    records: list[dict],
-    logger: logging.Logger,
-) -> None:
-    """Generic helper to write a formatted log sheet into a workbook."""
-    if sheet_name in wb.sheetnames:
-        del wb[sheet_name]
-    ws = wb.create_sheet(sheet_name)
-    border = _thin_border()
-
-    for ci, col_name in enumerate(columns, start=1):
-        cell = ws.cell(row=1, column=ci, value=col_name)
-        cell.font      = _hdr_font()
-        cell.fill      = _hdr_fill()
-        cell.alignment = _center()
-        cell.border    = border
-
-    for ri, record in enumerate(records, start=2):
-        for ci, col_name in enumerate(columns, start=1):
-            cell = ws.cell(row=ri, column=ci, value=record.get(col_name, ""))
-            cell.font   = _dat_font()
-            cell.border = border
-
-    for col_cells in ws.columns:
-        col_letter = get_column_letter(col_cells[0].column)
-        max_len = max(
-            (len(str(c.value)) for c in col_cells if c.value), default=10
-        )
-        ws.column_dimensions[col_letter].width = min(max_len + 4, 80)
-
-    ws.freeze_panes = "A2"
-    logger.info(f"'{sheet_name}' written: {len(records)} records.")
-
-
-def add_validation_sheet(wb, records, logger):
-    _write_log_sheet(
-        wb, "Validation_Log",
-        ["Check Type", "Template", "Sheet", "Data Lib", "Detail"],
-        records, logger
-    )
-
-
-def add_dvv_audit_sheet(wb, records, logger):
-    _write_log_sheet(
-        wb, "DVV_Audit_Log",
-        ["Issuer ID", "Series ID", "Data Lib", "Old Value", "New Value",
-         "Update Timestamp", "Template Name", "Worksheet Name", "Status"],
-        records, logger
-    )
-
-
 # ==============================================================================
 # SECTION 9: ORCHESTRATION (in memory)
 # ==============================================================================
@@ -699,14 +702,14 @@ def _wb_to_bytes(wb: openpyxl.Workbook) -> bytes:
 def process_one_issuer(
     issuer_id: str,
     issuer_ext_df: pd.DataFrame,
-    full_ext_df: pd.DataFrame,
     dvv_df: pd.DataFrame,
     templates: dict[str, bytes],
     logger: logging.Logger,
-) -> tuple[list[tuple[str, bytes]], dict]:
+) -> tuple[list[tuple[str, bytes]], dict, list[dict], list[dict]]:
     """
     Run the pipeline for a single issuer.
-    Returns (list of (filename, bytes), per-issuer summary dict).
+    Returns (output_files, summary, audit_records, validation_records).
+    Output files are ONLY the populated templates (v5 behaviour).
     """
     outputs: list[tuple[str, bytes]] = []
     all_template_headers: dict[str, dict[str, list]] = {}
@@ -738,7 +741,6 @@ def process_one_issuer(
         for m in sheet_meta.values():
             total_fields += len(m["headers"]) * m["populated_rows"]
 
-        audit_recs: list[dict] = []
         try:
             audit_recs = apply_dvv_overrides(
                 wb, sheet_meta, dvv_df, issuer_id, tmpl_key, logger
@@ -755,22 +757,14 @@ def process_one_issuer(
 
         try:
             for sn in wb.sheetnames:
-                if sn in ("Validation_Log", "DVV_Audit_Log"):
-                    continue
                 if sn in sheet_meta:
                     m = sheet_meta[sn]
                     format_worksheet(
-                        wb[sn], m["data_start_row"], m["populated_rows"],
-                        tmpl_key, logger,
+                        wb[sn], m["data_start_row"], m["populated_rows"], logger
                     )
         except Exception as e:
             logger.error(f"Formatting failed for '{tmpl_key}': {e}")
             logger.debug(traceback.format_exc())
-
-        try:
-            add_dvv_audit_sheet(wb, audit_recs, logger)
-        except Exception as e:
-            logger.warning(f"DVV_Audit_Log not written for '{tmpl_key}': {e}")
 
         out_name = f"{issuer_id}_{CONFIG['OUTPUT_NAMES'][tmpl_key]}.xlsx"
         try:
@@ -781,7 +775,7 @@ def process_one_issuer(
             logger.error(msg)
             errors.append(msg)
 
-    # Validation report
+    # Validation — computed for on-screen display only (no file written).
     val_records = build_validation_log(
         all_template_headers, issuer_ext_df, issuer_id, logger
     )
@@ -793,31 +787,6 @@ def process_one_issuer(
                 "Data Lib": rec["Data Lib"], "Detail": rec["Status"],
             })
 
-    try:
-        vwb = openpyxl.Workbook()
-        vwb.active.title = "Validation_Log"
-        add_validation_sheet(vwb, val_records, logger)
-        if "Sheet" in vwb.sheetnames:
-            del vwb["Sheet"]
-        outputs.append(
-            (f"{issuer_id}_Validation_Report.xlsx", _wb_to_bytes(vwb))
-        )
-    except Exception as e:
-        logger.warning(f"Validation report not written: {e}")
-
-    # DVV audit report
-    try:
-        awb = openpyxl.Workbook()
-        awb.active.title = "DVV_Audit_Log"
-        add_dvv_audit_sheet(awb, all_audit_records, logger)
-        if "Sheet" in awb.sheetnames:
-            del awb["Sheet"]
-        outputs.append(
-            (f"{issuer_id}_DVV_Audit_Report.xlsx", _wb_to_bytes(awb))
-        )
-    except Exception as e:
-        logger.warning(f"DVV Audit report not written: {e}")
-
     summary = {
         "Issuer ID": issuer_id,
         "Records Processed": len(issuer_ext_df),
@@ -826,7 +795,7 @@ def process_one_issuer(
         "Validation Issues": len(val_records),
         "Errors": errors,
     }
-    return outputs, summary
+    return outputs, summary, all_audit_records, val_records
 
 
 def run_pipeline(
@@ -834,11 +803,11 @@ def run_pipeline(
     dvv_bytes: bytes, dvv_name: str,
     templates: dict[str, bytes],
     logger: logging.Logger,
-) -> tuple[bytes, list[dict], list[tuple[str, bytes]]]:
+) -> dict:
     """
     Full pipeline. Detects issuer ID(s) from the CSV, processes each, and
-    bundles all output files into a single ZIP.
-    Returns (zip_bytes, list of per-issuer summaries, list of (name, bytes)).
+    bundles the populated template files into a single ZIP.
+    Returns a result dict.
     """
     logger.info("=" * 60)
     logger.info("STEP 1: Loading extraction CSV")
@@ -853,8 +822,7 @@ def run_pipeline(
     dvv_df = load_dvv(dvv_bytes, dvv_name, logger)
 
     issuer_col = CONFIG["ISSUER_ID_FIELD"]
-    # One issuer -> use the full CSV (faithful to the original behaviour).
-    # Many issuers -> filter the CSV per issuer.
+    # One issuer -> use the full CSV. Many issuers -> filter the CSV per issuer.
     if len(issuer_ids) == 1:
         jobs = [(issuer_ids[0], ext_df)]
     else:
@@ -868,18 +836,22 @@ def run_pipeline(
 
     all_outputs: list[tuple[str, bytes]] = []
     summaries: list[dict] = []
+    audit_records: list[dict] = []
+    validation_records: list[dict] = []
+
     for issuer_id, issuer_df in jobs:
-        outs, summ = process_one_issuer(
-            issuer_id, issuer_df, ext_df, dvv_df, templates, logger
+        outs, summ, audits, vals = process_one_issuer(
+            issuer_id, issuer_df, dvv_df, templates, logger
         )
-        # When processing many issuers, keep files apart in per-issuer folders.
         if len(jobs) > 1:
             outs = [(f"{issuer_id}/{name}", data) for name, data in outs]
         all_outputs.extend(outs)
         summaries.append(summ)
+        audit_records.extend(audits)
+        validation_records.extend(vals)
 
     logger.info("=" * 60)
-    logger.info("STEP 5: Building ZIP archive")
+    logger.info("STEP 5: Building ZIP archive (templates only)")
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in all_outputs:
@@ -890,7 +862,14 @@ def run_pipeline(
     logger.info("=" * 60)
     logger.info(f"DONE. Issuers: {len(summaries)} | "
                 f"Files: {len(all_outputs)} | Errors: {total_errors}")
-    return zip_buf.getvalue(), summaries, all_outputs
+
+    return {
+        "zip_bytes": zip_buf.getvalue(),
+        "summaries": summaries,
+        "n_files": len(all_outputs),
+        "audit_records": audit_records,
+        "validation_records": validation_records,
+    }
 
 
 # ==============================================================================
@@ -906,10 +885,14 @@ def main() -> None:
 
     st.title("MSCI Annual Update Factual Process")
     st.caption(
-        "Upload the extraction CSV, the DVV merged file and the templates, "
-        "then run. The Issuer ID is read automatically from the "
-        "`DMX_ISSUER_ID` column of the CSV."
+        "Upload the extraction CSV and the DVV merged file, then run. "
+        "The three templates are fixed (bundled with the app) and the Issuer ID "
+        "is read automatically from the `DMX_ISSUER_ID` column of the CSV."
     )
+
+    # ---- Load the fixed templates (bundled with the app) --------------------
+    boot_logger, _ = setup_logging()
+    fixed_templates, missing_templates = load_fixed_templates(boot_logger)
 
     # ---- Uploads ------------------------------------------------------------
     st.subheader("1 · Input files")
@@ -922,25 +905,36 @@ def main() -> None:
         help="Data Lib in column F, Correct Value in AG, Series ID in AL.",
     )
 
-    st.subheader("2 · Templates")
-    st.caption("Upload the templates you want to produce. Each one is optional.")
-    template_files: dict[str, object] = {}
-    slot_labels = list(CONFIG["TEMPLATE_SLOTS"].keys())
-    cols = st.columns(2)
-    for i, slot_label in enumerate(slot_labels):
-        with cols[i % 2]:
-            up = st.file_uploader(
-                f"{slot_label} template", type=["xlsx"],
-                key=f"tmpl_{slot_label}",
-            )
-            if up is not None:
-                template_files[CONFIG["TEMPLATE_SLOTS"][slot_label]] = up
+    # ---- Fixed templates status --------------------------------------------
+    st.subheader("2 · Templates (fixed)")
+    if fixed_templates:
+        found = ", ".join(
+            CONFIG["TEMPLATE_LABELS"].get(k, k) for k in fixed_templates
+        )
+        st.success(f"Loaded bundled templates: {found}")
+    if missing_templates:
+        miss = ", ".join(
+            CONFIG["TEMPLATE_LABELS"].get(k, k) for k in missing_templates
+        )
+        st.warning(
+            f"Not found in the '{CONFIG['TEMPLATE_DIR']}/' folder: {miss}. "
+            "These outputs will be skipped. Commit the files to fix this."
+        )
+    if not fixed_templates:
+        st.error(
+            f"No template files found in the '{CONFIG['TEMPLATE_DIR']}/' folder. "
+            "Add them to the repository before running."
+        )
 
     # ---- Run ----------------------------------------------------------------
     st.subheader("3 · Run")
-    ready = csv_file is not None and dvv_file is not None and len(template_files) > 0
+    ready = (
+        csv_file is not None
+        and dvv_file is not None
+        and len(fixed_templates) > 0
+    )
     if not ready:
-        st.info("Upload a CSV, a DVV file and at least one template to enable Run.")
+        st.info("Upload a CSV and a DVV file to enable Run.")
 
     run = st.button("▶ Run", type="primary", disabled=not ready, use_container_width=True)
 
@@ -948,32 +942,26 @@ def main() -> None:
         logger, log_buffer = setup_logging()
         try:
             with st.spinner("Processing…"):
-                templates_bytes = {
-                    key: up.getvalue() for key, up in template_files.items()
-                }
-                zip_bytes, summaries, outputs = run_pipeline(
+                result = run_pipeline(
                     csv_file.getvalue(), csv_file.name,
                     dvv_file.getvalue(), dvv_file.name,
-                    templates_bytes, logger,
+                    fixed_templates, logger,
                 )
-            # Persist in session so the download button survives a rerun.
-            st.session_state["zip_bytes"] = zip_bytes
-            st.session_state["summaries"] = summaries
-            st.session_state["log_text"]  = log_buffer.getvalue()
-            st.session_state["n_files"]   = len(outputs)
+            result["log_text"] = log_buffer.getvalue()
+            st.session_state["result"] = result
             st.success("Processing complete.")
         except Exception as e:
-            st.session_state.pop("zip_bytes", None)
-            st.session_state["log_text"] = log_buffer.getvalue()
+            st.session_state.pop("result", None)
             st.error(f"Processing failed: {e}")
             with st.expander("Execution log", expanded=True):
                 st.code(log_buffer.getvalue() or "(no log)", language="text")
 
     # ---- Results ------------------------------------------------------------
-    if "zip_bytes" in st.session_state:
+    result = st.session_state.get("result")
+    if result:
         st.subheader("4 · Results")
 
-        summaries = st.session_state.get("summaries", [])
+        summaries = result.get("summaries", [])
         total_records = sum(s["Records Processed"] for s in summaries)
         total_dvv     = sum(s["DVV Overrides"] for s in summaries)
         total_val     = sum(s["Validation Issues"] for s in summaries)
@@ -988,7 +976,6 @@ def main() -> None:
         if total_err:
             st.warning(f"{total_err} error(s) occurred — see the per-issuer detail and log.")
 
-        # Per-issuer breakdown
         if summaries:
             table = pd.DataFrame([{
                 "Issuer ID": s["Issuer ID"],
@@ -1007,15 +994,45 @@ def main() -> None:
             zip_name = f"AnnualUpdate_Output_{ts}.zip"
 
         st.download_button(
-            label=f"⬇ Download all outputs ({st.session_state.get('n_files', 0)} files, ZIP)",
-            data=st.session_state["zip_bytes"],
+            label=f"⬇ Download outputs ({result.get('n_files', 0)} files, ZIP)",
+            data=result["zip_bytes"],
             file_name=zip_name,
             mime="application/zip",
             use_container_width=True,
         )
 
+        # DVV audit trail (on-screen + optional CSV; not inside the ZIP).
+        audit = result.get("audit_records", [])
+        with st.expander(f"DVV audit trail ({len(audit)} record(s))"):
+            if audit:
+                adf = pd.DataFrame(audit)
+                st.dataframe(adf, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇ DVV audit log (CSV)",
+                    data=adf.to_csv(index=False).encode("utf-8"),
+                    file_name="DVV_Audit_Log.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.write("No DVV changes were applied.")
+
+        # Validation issues (on-screen + optional CSV).
+        vals = result.get("validation_records", [])
+        with st.expander(f"Validation issues ({len(vals)})"):
+            if vals:
+                vdf = pd.DataFrame(vals)
+                st.dataframe(vdf, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇ Validation issues (CSV)",
+                    data=vdf.to_csv(index=False).encode("utf-8"),
+                    file_name="Validation_Issues.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.write("No validation issues found.")
+
         with st.expander("Execution log"):
-            st.code(st.session_state.get("log_text", "") or "(no log)", language="text")
+            st.code(result.get("log_text", "") or "(no log)", language="text")
 
 
 if __name__ == "__main__":
