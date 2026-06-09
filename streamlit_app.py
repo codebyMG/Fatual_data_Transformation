@@ -130,9 +130,15 @@ def setup_logging() -> tuple[logging.Logger, io.StringIO]:
     return logger, log_buffer
 
 
-def _template_dir() -> Path:
-    """Absolute path to the bundled templates folder, relative to this file."""
-    return Path(__file__).resolve().parent / CONFIG["TEMPLATE_DIR"]
+def _candidate_dirs() -> list[Path]:
+    """
+    Directories searched for the fixed template files, in priority order:
+    the app's own folder (repo root) first, then a 'templates/' subfolder.
+    This works whether the files are committed at the repo root or inside
+    a 'templates/' folder.
+    """
+    base = Path(__file__).resolve().parent
+    return [base, base / CONFIG["TEMPLATE_DIR"]]
 
 
 def load_fixed_templates(logger: logging.Logger) -> tuple[dict[str, bytes], list[str]]:
@@ -140,18 +146,23 @@ def load_fixed_templates(logger: logging.Logger) -> tuple[dict[str, bytes], list
     Load the fixed template files bundled with the app.
     Returns (templates_bytes_by_key, list_of_missing_keys).
     """
-    tmpl_dir = _template_dir()
+    candidates = _candidate_dirs()
     templates: dict[str, bytes] = {}
     missing: list[str] = []
 
     for key, filename in CONFIG["TEMPLATE_FILES"].items():
-        path = tmpl_dir / filename
-        if path.exists():
-            templates[key] = path.read_bytes()
-            logger.info(f"Loaded fixed template '{key}': {filename}")
+        found_path = next(
+            (d / filename for d in candidates if (d / filename).exists()), None
+        )
+        if found_path is not None:
+            templates[key] = found_path.read_bytes()
+            logger.info(f"Loaded fixed template '{key}': {found_path}")
         else:
             missing.append(key)
-            logger.warning(f"Fixed template '{key}' not found: {path}")
+            logger.warning(
+                f"Fixed template '{key}' ({filename}) not found in: "
+                + ", ".join(str(d) for d in candidates)
+            )
 
     return templates, missing
 
@@ -892,7 +903,7 @@ def main() -> None:
 
     # ---- Load the fixed templates (bundled with the app) --------------------
     boot_logger, _ = setup_logging()
-    fixed_templates, missing_templates = load_fixed_templates(boot_logger)
+    fixed_templates, _missing = load_fixed_templates(boot_logger)
 
     # ---- Uploads ------------------------------------------------------------
     st.subheader("1 · Input files")
@@ -905,35 +916,25 @@ def main() -> None:
         help="Data Lib in column F, Correct Value in AG, Series ID in AL.",
     )
 
-    # ---- Fixed templates status --------------------------------------------
-    st.subheader("2 · Templates (fixed)")
-    if fixed_templates:
-        found = ", ".join(
-            CONFIG["TEMPLATE_LABELS"].get(k, k) for k in fixed_templates
-        )
-        st.success(f"Loaded bundled templates: {found}")
-    if missing_templates:
-        miss = ", ".join(
-            CONFIG["TEMPLATE_LABELS"].get(k, k) for k in missing_templates
-        )
-        st.warning(
-            f"Not found in the '{CONFIG['TEMPLATE_DIR']}/' folder: {miss}. "
-            "These outputs will be skipped. Commit the files to fix this."
-        )
+    # ---- Fixed templates (loaded silently) ----------------------------------
+    # The status panel is intentionally not shown. A single error is surfaced
+    # only if no templates could be found at all, so the app never fails
+    # silently.
     if not fixed_templates:
         st.error(
-            f"No template files found in the '{CONFIG['TEMPLATE_DIR']}/' folder. "
-            "Add them to the repository before running."
+            "No template files were found in the repository. Expected: "
+            + ", ".join(CONFIG["TEMPLATE_FILES"].values())
+            + ". Commit them to the repo root (or a 'templates/' folder)."
         )
 
     # ---- Run ----------------------------------------------------------------
-    st.subheader("3 · Run")
+    st.subheader("2 · Run")
     ready = (
         csv_file is not None
         and dvv_file is not None
         and len(fixed_templates) > 0
     )
-    if not ready:
+    if not ready and fixed_templates:
         st.info("Upload a CSV and a DVV file to enable Run.")
 
     run = st.button("▶ Run", type="primary", disabled=not ready, use_container_width=True)
@@ -959,7 +960,7 @@ def main() -> None:
     # ---- Results ------------------------------------------------------------
     result = st.session_state.get("result")
     if result:
-        st.subheader("4 · Results")
+        st.subheader("3 · Results")
 
         summaries = result.get("summaries", [])
         total_records = sum(s["Records Processed"] for s in summaries)
