@@ -2,8 +2,16 @@
 ================================================================================
 MSCI Annual Update Factual Process Automation  —  Streamlit Web App
 ================================================================================
-Version     : 5.0.0 (Streamlit)
+Version     : 5.1.0 (Streamlit)
 Based on    : annual_update_processor v5.0.0 (command-line)
+
+Changes in 5.1.0
+  - DVV columns are now matched by HEADER NAME (DATALIB_TAG / CORRECT_VALUE /
+    SERIALID) instead of fixed Excel column letters (F / AG / AL). A new
+    'UUID4' column inserted at position A in the DVV export shifted every
+    column by one and broke letter-based matching; header matching is robust
+    to such insertions/removals. Matching is case-insensitive and
+    whitespace-tolerant, and raises a clear error if a header is missing.
 
 What this app does
   Upload the extraction CSV and the DVV merged file, press Run, and download
@@ -88,10 +96,14 @@ CONFIG = {
     # All other sheets in any template are treated as series-level.
     "SCALAR_SHEET_NAME": "Scalar",
 
-    # DVV column letters (Excel column letters in the DVV merged file).
-    "DVV_DATALIB_COL":    "F",   # Column F  -> Data Lib
-    "DVV_CORRECTVAL_COL": "AG",  # Column AG -> Correct Value
-    "DVV_SERIES_COL":     "AL",  # Column AL -> Series ID
+    # DVV columns matched by HEADER NAME (robust to column insertion/removal
+    # upstream). Earlier versions matched by fixed Excel column letters
+    # (F / AG / AL); a new 'UUID4' column inserted at position A shifted every
+    # column by one and broke that approach. Header-name matching survives such
+    # changes as long as these header names exist in the DVV file's row 1.
+    "DVV_DATALIB_HEADER":    "DATALIB_TAG",    # -> Data Lib
+    "DVV_CORRECTVAL_HEADER": "CORRECT_VALUE",  # -> Correct Value
+    "DVV_SERIES_HEADER":     "SERIALID",       # -> Series ID
 
     # Column E = index 4 (0-based) in the RAW CSV holds the Series ID.
     "EXTRACTION_SERIES_COL_INDEX": 4,
@@ -274,16 +286,15 @@ def load_dvv(file_bytes: bytes, display_name: str,
              logger: logging.Logger) -> pd.DataFrame:
     """
     Load DVV Merged XLSX (from uploaded bytes). Read as strings, keep only
-    rows where Correct Value (Column AG) is non-blank.
+    rows where Correct Value is non-blank.
+
+    Columns are matched by HEADER NAME (row 1), not by fixed Excel column
+    letters. This is robust to columns being inserted or removed upstream
+    (e.g. a new 'UUID4' column at position A) as long as the expected header
+    names still exist. Header matching is case-insensitive and ignores
+    surrounding whitespace.
     """
     logger.info(f"Loading DVV file: {display_name}")
-
-    def col_letter_to_index(letter: str) -> int:
-        letter = letter.upper()
-        result = 0
-        for ch in letter:
-            result = result * 26 + (ord(ch) - ord('A') + 1)
-        return result - 1
 
     try:
         dvv_df = pd.read_excel(
@@ -296,29 +307,41 @@ def load_dvv(file_bytes: bytes, display_name: str,
     if dvv_df.empty:
         raise ValueError(f"DVV file is empty: {display_name}")
 
-    datalib_idx    = col_letter_to_index(CONFIG["DVV_DATALIB_COL"])
-    correctval_idx = col_letter_to_index(CONFIG["DVV_CORRECTVAL_COL"])
-    series_idx     = col_letter_to_index(CONFIG["DVV_SERIES_COL"])
+    # Build a case-insensitive, whitespace-tolerant lookup of actual headers.
+    norm_to_actual = {
+        str(c).strip().upper(): c for c in dvv_df.columns
+    }
 
-    max_needed = max(datalib_idx, correctval_idx, series_idx)
-    if dvv_df.shape[1] <= max_needed:
+    wanted = {
+        CONFIG["DVV_DATALIB_HEADER"]:    "_DVV_DATALIB",
+        CONFIG["DVV_CORRECTVAL_HEADER"]: "_DVV_CORRECT_VALUE",
+        CONFIG["DVV_SERIES_HEADER"]:     "_DVV_SERIES_ID",
+    }
+
+    rename_map: dict = {}
+    missing: list[str] = []
+    for header_name, internal_name in wanted.items():
+        actual = norm_to_actual.get(header_name.strip().upper())
+        if actual is None:
+            missing.append(header_name)
+        else:
+            rename_map[actual] = internal_name
+
+    if missing:
         raise ValueError(
-            f"DVV file has only {dvv_df.shape[1]} columns; "
-            f"need at least {max_needed + 1} "
-            f"(up to column {CONFIG['DVV_SERIES_COL']})."
+            "DVV file is missing expected column header(s): "
+            + ", ".join(missing)
+            + ". Found headers: "
+            + ", ".join(str(c) for c in dvv_df.columns)
         )
 
-    cols = dvv_df.columns.tolist()
+    dvv_df = dvv_df.rename(columns=rename_map)
     logger.info(
-        f"DVV columns -> DataLib='{cols[datalib_idx]}' "
-        f"CorrectVal='{cols[correctval_idx]}' SeriesID='{cols[series_idx]}'"
+        "DVV columns matched by header -> "
+        f"DataLib='{CONFIG['DVV_DATALIB_HEADER']}' "
+        f"CorrectVal='{CONFIG['DVV_CORRECTVAL_HEADER']}' "
+        f"SeriesID='{CONFIG['DVV_SERIES_HEADER']}'"
     )
-
-    dvv_df = dvv_df.rename(columns={
-        cols[datalib_idx]:    "_DVV_DATALIB",
-        cols[correctval_idx]: "_DVV_CORRECT_VALUE",
-        cols[series_idx]:     "_DVV_SERIES_ID",
-    })
 
     before = len(dvv_df)
     dvv_df = dvv_df[
@@ -913,7 +936,8 @@ def main() -> None:
     )
     dvv_file = st.file_uploader(
         "DVV merged file (XLSX)", type=["xlsx"], key="dvv",
-        help="Data Lib in column F, Correct Value in AG, Series ID in AL.",
+        help="Columns are matched by header name: DATALIB_TAG (Data Lib), "
+             "CORRECT_VALUE (Correct Value), SERIALID (Series ID).",
     )
 
     # ---- Fixed templates (loaded silently) ----------------------------------
