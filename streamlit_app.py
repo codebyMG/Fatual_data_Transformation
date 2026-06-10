@@ -93,7 +93,8 @@ CONFIG = {
     "EXTRACTION_SERIES_COL_INDEX": 29,
 
     # ── Field names ────────────────────────────────────────────────────────────
-    "ISSUER_ID_FIELD": "DMX_ISSUER_ID",
+    "ISSUER_ID_FIELD":   "DMX_ISSUER_ID",
+    "ISSUER_NAME_FIELD": "DMX_ISSUER_NAME",
 
     # ── Individual name column ────────────────────────────────────────────────
     "INDIVIDUAL_NAME_FIELD":      "REL_INDIVID",
@@ -236,6 +237,20 @@ def read_issuer_id_from_df(ext_df: pd.DataFrame) -> str:
     )
 
 
+def read_issuer_name_from_df(ext_df: pd.DataFrame) -> str | None:
+    """
+    Read the Issuer Name from the DMX_ISSUER_NAME column of the CSV.
+    Returns the first non-blank value, or None if the column is absent/empty.
+    """
+    field = CONFIG["ISSUER_NAME_FIELD"]
+    if field not in ext_df.columns:
+        return None
+    for val in ext_df[field]:
+        if pd.notna(val) and str(val).strip() not in ("", "nan"):
+            return str(val).strip()
+    return None
+
+
 def build_datalib_to_series_map(ext_df: pd.DataFrame) -> dict[str, int]:
     """Map each data lib code to the nearest preceding 'Series ID' column index."""
     cols = list(ext_df.columns)
@@ -307,10 +322,119 @@ def row_has_data(ext_row: pd.Series, template_headers: list[str]) -> bool:
 # SECTION 4: DVV FILE PROCESSING
 # ==============================================================================
 
+def _read_dvv_bytes(dvv_source) -> bytes:
+    """Return the raw bytes of the DVV file from bytes, a path, or a file-like."""
+    if isinstance(dvv_source, (bytes, bytearray)):
+        return bytes(dvv_source)
+    if hasattr(dvv_source, "read"):
+        try:
+            dvv_source.seek(0)
+        except Exception:
+            pass
+        return dvv_source.read()
+    return Path(dvv_source).read_bytes()
+
+
+# The Correct Value column in the DVV merged file is a formula, not a literal:
+#     =IF($<status1>="Correct", <value1>, IF($<status2>="Correct", <value2>, ""))
+# When neither extraction is marked "Correct" the formula yields "" (blank), but
+# the file caches a stale 0 for that branch. pandas/openpyxl read the cached 0,
+# never recalculating — which is why blank corrections showed up as green zeros.
+# We parse the formula and evaluate it from its source columns so the true value
+# (usually blank) is used instead of the cached 0.
+_DVV_FORMULA_RE = re.compile(
+    r'=\s*IF\(\s*\$?([A-Z]+)\d+\s*=\s*"Correct"\s*,\s*\$?([A-Z]+)\d+\s*,\s*'
+    r'IF\(\s*\$?([A-Z]+)\d+\s*=\s*"Correct"\s*,\s*\$?([A-Z]+)\d+\s*,\s*""\s*\)\s*\)',
+    re.IGNORECASE,
+)
+
+
+def _resolve_correct_value_formulas(
+    dvv_df: pd.DataFrame,
+    dvv_bytes: bytes,
+    correctval_idx: int,
+    col_letter_to_index,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    """
+    Replace cached Correct Value cells that are actually formulas with their
+    real evaluated result. The formula picks EXTRACTION_1_VALUE when
+    EXTRACTION_1 == "Correct", else EXTRACTION_2_VALUE when EXTRACTION_2 ==
+    "Correct", else blank. Source columns are parsed from the formula itself,
+    so the logic adapts if the layout shifts. Cells that are plain literals
+    (the analyst's real corrections) are left untouched.
+    """
+    import io as _io
+    wsf = load_workbook(_io.BytesIO(dvv_bytes), data_only=False).worksheets[0]
+
+    ahcol = correctval_idx + 1  # 1-based for openpyxl
+    formula_rows = 0            # data-frame row indices that hold a formula
+    parsed = None               # (status1, value1, status2, value2) col indices
+
+    formula_idx: list[int] = []
+    for df_i in range(len(dvv_df)):
+        raw = wsf.cell(row=df_i + 2, column=ahcol).value  # +2: header is row 1
+        if isinstance(raw, str) and raw.lstrip().startswith("="):
+            formula_rows += 1
+            formula_idx.append(df_i)
+            if parsed is None:
+                m = _DVV_FORMULA_RE.match(raw.strip())
+                if m:
+                    s1, v1, s2, v2 = (col_letter_to_index(g) for g in m.groups())
+                    parsed = (s1, v1, s2, v2)
+
+    if formula_rows == 0:
+        return dvv_df
+
+    if parsed is None:
+        logger.warning(
+            f"Correct Value column contains {formula_rows} formula cell(s) but "
+            "the formula pattern was not recognised — cached values are used as-is."
+        )
+        return dvv_df
+
+    s1, v1, s2, v2 = parsed
+    cv_col = dvv_df.columns[correctval_idx]
+
+    def _cell(df_i, idx):
+        if idx >= dvv_df.shape[1]:
+            return None
+        val = dvv_df.iat[df_i, idx]
+        return None if pd.isna(val) else val
+
+    resolved_nonblank = 0
+    for df_i in formula_idx:
+        e1 = _cell(df_i, s1)
+        e2 = _cell(df_i, s2)
+        if e1 is not None and str(e1).strip().lower() == "correct":
+            new_val = _cell(df_i, v1)
+        elif e2 is not None and str(e2).strip().lower() == "correct":
+            new_val = _cell(df_i, v2)
+        else:
+            new_val = ""  # formula's empty branch — a true blank, not 0
+        dvv_df.iat[df_i, correctval_idx] = (
+            "" if (new_val is None or str(new_val).strip() == "") else str(new_val).strip()
+        )
+        if dvv_df.iat[df_i, correctval_idx] != "":
+            resolved_nonblank += 1
+
+    logger.info(
+        f"Correct Value formulas resolved: {formula_rows} formula cell(s) "
+        f"({resolved_nonblank} → real value, {formula_rows - resolved_nonblank} → blank). "
+        "Cached zeros from the formula's empty branch were discarded."
+    )
+    return dvv_df
+
+
 def load_dvv(dvv_source, logger: logging.Logger) -> pd.DataFrame:
     """
-    Load DVV Merged XLSX (path or file-like). Two sequential filters:
-        FILTER 1 — keep rows where Correct Value (Col AH) is non-blank.
+    Load DVV Merged XLSX (path or file-like).
+
+    The Correct Value column (AH) is formula-driven; cached results in the file
+    are unreliable (blank branches are cached as 0). We therefore evaluate those
+    formulas from their source columns before filtering. Two sequential filters:
+        FILTER 1 — keep rows where Correct Value is non-blank. "0" is kept as a
+                   genuine value; blanks are never coerced into 0.
         FILTER 2 — drop rows whose TAB (Col B) is in the exclude list.
     """
     def col_letter_to_index(letter: str) -> int:
@@ -320,9 +444,11 @@ def load_dvv(dvv_source, logger: logging.Logger) -> pd.DataFrame:
             result = result * 26 + (ord(ch) - ord('A') + 1)
         return result - 1
 
+    dvv_bytes = _read_dvv_bytes(dvv_source)
+
     try:
         dvv_df = pd.read_excel(
-            dvv_source, sheet_name=0, dtype=str, header=0, engine="openpyxl"
+            io.BytesIO(dvv_bytes), sheet_name=0, dtype=str, header=0, engine="openpyxl"
         )
     except Exception as e:
         raise RuntimeError(f"Cannot read DVV file: {e}")
@@ -343,6 +469,12 @@ def load_dvv(dvv_source, logger: logging.Logger) -> pd.DataFrame:
             f"need at least {max_needed + 1} (up to column {CONFIG['DVV_SERIES_COL']})."
         )
 
+    # Resolve formula-driven Correct Values (replaces stale cached zeros with the
+    # formula's true result) BEFORE renaming, while positions match the raw file.
+    dvv_df = _resolve_correct_value_formulas(
+        dvv_df, dvv_bytes, correctval_idx, col_letter_to_index, logger
+    )
+
     cols = dvv_df.columns.tolist()
     logger.info(
         f"DVV columns -> TAB='{cols[tab_idx]}' UID='{cols[uid_idx]}' "
@@ -360,14 +492,19 @@ def load_dvv(dvv_source, logger: logging.Logger) -> pd.DataFrame:
 
     total_rows = len(dvv_df)
 
-    # FILTER 1 — Correct Value not blank
-    dvv_df = dvv_df[
+    # FILTER 1 — Correct Value must be non-blank.
+    # A blank cell (NaN or empty/whitespace string) is dropped. Everything else
+    # is kept verbatim: "0" is a valid correct value and is NOT filtered out,
+    # and blanks are never coerced into 0.
+    nonblank = (
         dvv_df["_DVV_CORRECT_VALUE"].notna() &
-        (dvv_df["_DVV_CORRECT_VALUE"].str.strip() != "")
-    ].copy()
+        (dvv_df["_DVV_CORRECT_VALUE"].astype(str).str.strip() != "")
+    )
+    dvv_df = dvv_df[nonblank].copy()
     after_filter1 = len(dvv_df)
     logger.info(
-        f"DVV Filter 1 (Correct Value not blank): {total_rows} -> {after_filter1} rows"
+        f"DVV Filter 1 (Correct Value non-blank; zeros kept): "
+        f"{total_rows} -> {after_filter1} rows"
     )
 
     # FILTER 2 — TAB exclusion (positional Column B)
@@ -646,6 +783,14 @@ def apply_dvv_overrides(
                     str(correct_val).strip().lower() == "yes"):
                 correct_val = "1"
 
+            # Defensive: never write a blank/NaN Correct Value into the template.
+            # Filter 1 in load_dvv already removes blanks and numeric zeros, but
+            # this guard guarantees a blank can never overwrite a real cell or
+            # appear as 0, regardless of upstream config changes.
+            correct_val = "" if correct_val is None else str(correct_val).strip()
+            if correct_val == "" or correct_val.lower() in ("nan", "none"):
+                continue
+
             if not datalib or datalib not in header_col_map:
                 continue
 
@@ -894,15 +1039,22 @@ def run_pipeline(
     ext_df = load_extraction(io.BytesIO(csv_bytes), "", logger)
     summary["Records Processed"] = len(ext_df)
 
-    # ── STEP 2: Issuer ID from CSV; Issuer Name from filename ──────────────
+    # ── STEP 2: Issuer ID and Issuer Name from the CSV ─────────────────────
     issuer_id = read_issuer_id_from_df(ext_df)
     summary["Issuer ID"] = issuer_id
-    stem = Path(csv_filename).stem
-    parts = stem.split("_", 1)
-    issuer_name = parts[1].strip() if len(parts) == 2 else issuer_id
+
+    issuer_name = read_issuer_name_from_df(ext_df)
+    if issuer_name:
+        name_source = CONFIG["ISSUER_NAME_FIELD"]
+    else:
+        # Fallback: parse from the uploaded filename  IID..._Name.csv
+        stem = Path(csv_filename).stem
+        parts = stem.split("_", 1)
+        issuer_name = parts[1].strip() if len(parts) == 2 else issuer_id
+        name_source = "filename"
     summary["Issuer Name"] = issuer_name
     logger.info(f"Issuer ID (from {CONFIG['ISSUER_ID_FIELD']}): {issuer_id}")
-    logger.info(f"Issuer Name (from filename): {issuer_name}")
+    logger.info(f"Issuer Name (from {name_source}): {issuer_name}")
 
     # ── STEP 3: Load DVV file ──────────────────────────────────────────────
     logger.info("=" * 70)
