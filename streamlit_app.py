@@ -2,8 +2,18 @@
 ================================================================================
 MSCI Annual Update Factual Process Automation  —  Streamlit Web App
 ================================================================================
-Version     : 5.1.0 (Streamlit)
+Version     : 5.2.0 (Streamlit)
 Based on    : annual_update_processor v5.0.0 (command-line)
+
+Changes in 5.2.0
+  - DVV rows are now filtered in two stages before any override is applied:
+      1. keep only rows with a non-blank CORRECT_VALUE;
+      2. drop rows whose TAB is Individual, Director Data - Board,
+         Director Attributes, or Positions (CONFIG["DVV_EXCLUDED_TABS"]).
+  - Override routing is driven by the DVV Series ID: blank Series ID -> scalar
+    sheet, matched by DATALIB_TAG only; non-blank Series ID -> series sheets,
+    matched by serial_id + DATALIB_TAG. Blank-Series rows no longer raise a
+    "Blank DVV Series ID" exception (they are valid scalar corrections).
 
 Changes in 5.1.0
   - DVV columns are now matched by HEADER NAME (DATALIB_TAG / CORRECT_VALUE /
@@ -104,6 +114,18 @@ CONFIG = {
     "DVV_DATALIB_HEADER":    "DATALIB_TAG",    # -> Data Lib
     "DVV_CORRECTVAL_HEADER": "CORRECT_VALUE",  # -> Correct Value
     "DVV_SERIES_HEADER":     "SERIALID",       # -> Series ID
+    "DVV_TAB_HEADER":        "TAB",            # -> TAB (used for filtering)
+
+    # TAB values to EXCLUDE from DVV overrides. Rows whose TAB is any of these
+    # are dropped after the CORRECT_VALUE filter and never applied to the
+    # templates. (Individual / director-attribute / position rows are handled
+    # elsewhere and must not override the bulk-upload templates.)
+    "DVV_EXCLUDED_TABS": {
+        "Individual",
+        "Director Data - Board",
+        "Director Attributes",
+        "Positions",
+    },
 
     # Column E = index 4 (0-based) in the RAW CSV holds the Series ID.
     "EXTRACTION_SERIES_COL_INDEX": 4,
@@ -285,14 +307,22 @@ def detect_issuer_ids(ext_df: pd.DataFrame,
 def load_dvv(file_bytes: bytes, display_name: str,
              logger: logging.Logger) -> pd.DataFrame:
     """
-    Load DVV Merged XLSX (from uploaded bytes). Read as strings, keep only
-    rows where Correct Value is non-blank.
+    Load DVV Merged XLSX (from uploaded bytes) and return the rows to apply.
 
-    Columns are matched by HEADER NAME (row 1), not by fixed Excel column
-    letters. This is robust to columns being inserted or removed upstream
-    (e.g. a new 'UUID4' column at position A) as long as the expected header
-    names still exist. Header matching is case-insensitive and ignores
-    surrounding whitespace.
+    Columns are matched by HEADER NAME (row 1), not fixed Excel column letters,
+    so the function is robust to columns being inserted/removed upstream.
+    Matching is case-insensitive and whitespace-tolerant.
+
+    Two filters are applied, in this order:
+      1. Keep only rows where CORRECT_VALUE is non-blank.
+      2. Drop rows whose TAB is in CONFIG["DVV_EXCLUDED_TABS"]
+         (Individual, Director Data - Board, Director Attributes, Positions).
+
+    The surviving rows split into:
+      - scalar rows  : SERIALID is blank  -> applied to the Scalar sheet by
+                       DATALIB_TAG only (handled in apply_dvv_overrides).
+      - series rows  : SERIALID is present -> applied to series sheets by
+                       SERIALID + DATALIB_TAG.
     """
     logger.info(f"Loading DVV file: {display_name}")
 
@@ -316,6 +346,7 @@ def load_dvv(file_bytes: bytes, display_name: str,
         CONFIG["DVV_DATALIB_HEADER"]:    "_DVV_DATALIB",
         CONFIG["DVV_CORRECTVAL_HEADER"]: "_DVV_CORRECT_VALUE",
         CONFIG["DVV_SERIES_HEADER"]:     "_DVV_SERIES_ID",
+        CONFIG["DVV_TAB_HEADER"]:        "_DVV_TAB",
     }
 
     rename_map: dict = {}
@@ -340,18 +371,37 @@ def load_dvv(file_bytes: bytes, display_name: str,
         "DVV columns matched by header -> "
         f"DataLib='{CONFIG['DVV_DATALIB_HEADER']}' "
         f"CorrectVal='{CONFIG['DVV_CORRECTVAL_HEADER']}' "
-        f"SeriesID='{CONFIG['DVV_SERIES_HEADER']}'"
+        f"SeriesID='{CONFIG['DVV_SERIES_HEADER']}' "
+        f"TAB='{CONFIG['DVV_TAB_HEADER']}'"
     )
 
-    before = len(dvv_df)
+    # ── Filter 1: keep only rows that HAVE a Correct Value ────────────────────
+    total = len(dvv_df)
     dvv_df = dvv_df[
         dvv_df["_DVV_CORRECT_VALUE"].notna()
         & (dvv_df["_DVV_CORRECT_VALUE"].str.strip() != "")
     ].copy()
+    after_cv = len(dvv_df)
+    logger.info(f"DVV filter 1 (Correct Value present): {total} -> {after_cv} rows")
 
+    # ── Filter 2: drop excluded TAB categories ────────────────────────────────
+    # Case-insensitive, whitespace-tolerant comparison against the excluded set.
+    excluded_norm = {t.strip().upper() for t in CONFIG["DVV_EXCLUDED_TABS"]}
+    tab_norm = dvv_df["_DVV_TAB"].fillna("").astype(str).str.strip().str.upper()
+    dvv_df = dvv_df[~tab_norm.isin(excluded_norm)].copy()
+    after_tab = len(dvv_df)
     logger.info(
-        f"DVV loaded: {before} total rows, "
-        f"{len(dvv_df)} rows with Correct Values"
+        f"DVV filter 2 (excluded TABs {sorted(CONFIG['DVV_EXCLUDED_TABS'])}): "
+        f"{after_cv} -> {after_tab} rows"
+    )
+
+    # Split for logging: scalar rows (no Series ID) vs series rows (Series ID).
+    sid_norm = dvv_df["_DVV_SERIES_ID"].fillna("").astype(str).str.strip().str.lower()
+    n_scalar = int((sid_norm.isin(["", "nan"])).sum())
+    n_series = after_tab - n_scalar
+    logger.info(
+        f"DVV rows to apply: {after_tab} total "
+        f"({n_scalar} scalar / no Series ID, {n_series} series / with Series ID)"
     )
     return dvv_df
 
@@ -487,9 +537,17 @@ def apply_dvv_overrides(
 ) -> list[dict]:
     """
     Apply DVV Correct Value overrides to the populated workbook.
-    Scalar sheet -> match on Data Lib. Other sheets -> match on Series ID +
-    Data Lib. The scalar sheet is detected by NAME (per-sheet).
-    Updated cells highlighted with DVV_HIGHLIGHT_COLOR. Returns audit records.
+
+    Routing is driven by the DVV row's Series ID:
+      - Scalar sheet (named CONFIG["SCALAR_SHEET_NAME"]): only DVV rows with a
+        BLANK Series ID are applied, matched by DATALIB_TAG. Rows that carry a
+        Series ID are series-level corrections and are skipped here.
+      - Series sheets: only DVV rows WITH a Series ID are applied, matched on
+        serial_id + DATALIB_TAG.
+
+    (The dvv_df passed in has already been filtered to non-blank Correct Values
+    with the excluded TABs removed — see load_dvv.)
+    Updated cells are highlighted with DVV_HIGHLIGHT_COLOR. Returns audit records.
     """
     dvv_fill = PatternFill(
         "solid",
@@ -523,7 +581,14 @@ def apply_dvv_overrides(
         for _, dvv_row in dvv_df.iterrows():
             datalib     = str(dvv_row.get("_DVV_DATALIB", "")).strip()
             correct_val = dvv_row.get("_DVV_CORRECT_VALUE")
-            dvv_series  = str(dvv_row.get("_DVV_SERIES_ID", "")).strip()
+
+            # Normalise the DVV Series ID; treat NaN / "nan" / "" all as blank.
+            raw_series = dvv_row.get("_DVV_SERIES_ID")
+            dvv_series = (
+                "" if (pd.isna(raw_series)
+                       or str(raw_series).strip().lower() in ("", "nan"))
+                else str(raw_series).strip()
+            )
 
             if not datalib or datalib not in header_col_map:
                 continue
@@ -531,28 +596,24 @@ def apply_dvv_overrides(
             target_col = header_col_map[datalib]
 
             if is_scalar:
+                # Scalar datapoints have NO Series ID -> map by DATALIB_TAG only.
+                # A DVV row that carries a Series ID is a series-level
+                # correction and must not touch the scalar sheet.
+                if dvv_series:
+                    continue
                 target_rows = list(range(
                     data_start_row, data_start_row + populated_rows
                 ))
             else:
-                if dvv_series:
-                    target_rows = [
-                        r for r, sid in row_series_map.items()
-                        if sid and sid == dvv_series
-                    ]
-                else:
-                    logger.warning(
-                        f"DVV row has blank Series ID for DataLib='{datalib}' "
-                        f"sheet='{sheet_name}'. Logged as exception."
-                    )
-                    audit_recs.append({
-                        "Issuer ID": issuer_id, "Series ID": "",
-                        "Data Lib": datalib, "Old Value": "",
-                        "New Value": str(correct_val), "Update Timestamp": ts,
-                        "Template Name": template_key, "Worksheet Name": sheet_name,
-                        "Status": "EXCEPTION: Blank DVV Series ID",
-                    })
+                # Series sheets -> only DVV rows that carry a Series ID,
+                # matched on serial_id + Data Lib. Scalar (blank-Series) rows
+                # are skipped here; they belong to the scalar sheet.
+                if not dvv_series:
                     continue
+                target_rows = [
+                    r for r, sid in row_series_map.items()
+                    if sid and sid == dvv_series
+                ]
 
             if not target_rows:
                 logger.warning(
