@@ -2,66 +2,42 @@
 ================================================================================
 MSCI Annual Update Factual Process Automation  —  Streamlit Web App
 ================================================================================
-Version     : 5.4.0 (Streamlit)
-Based on    : annual_update_processor v5.0.0 (command-line)
-              + Series-ID logic ported from command-line v13.0.0
-              + DVV override routing aligned with command-line v13.0.0
+Version     : 13.0.0 (Streamlit)
+Based on    : annual_update_processor v13.0.0 (command-line)
 
-Changes in 5.4.0
-  - apply_dvv_overrides() routing brought in line with the v13.0.0 command-line
-    script (DVV column matching stays HEADER-NAME based, so it is still robust
-    to inserted/removed columns):
-      * Scalar sheet: a DVV row whose DATALIB_TAG is a scalar header is now
-        written to the single issuer row regardless of its Series ID (v13 does
-        not require a blank Series ID for scalar datapoints).
-      * Series sheets: when a DVV Series ID has no matching serial_id row, a NEW
-        row is now CREATED (DMX_ISSUER_ID + serial_id + value, green) instead of
-        recording a "no matching row" exception. Newly created rows are counted,
-        formatted and AutoFiltered like populated rows.
-      * DVV rows with a blank Series ID are still skipped on series sheets.
-    The audit trail, validation panel, multi-issuer handling, bundled templates
-    and UI are unchanged.
+Changes in 13.0.0 (integrates the v13 command-line logic)
+  - SECTION-AWARE Series ID resolution. The extraction CSV contains MULTIPLE
+    "Series ID" columns (one per section: directors, committees, ownership …).
+    pandas loads these as 'Series ID', 'Series ID.1', 'Series ID.2', …  Each
+    data-lib column is now matched to the NEAREST "Series ID" column that sits
+    BEFORE it (build_datalib_to_series_map). This replaces the old single
+    fixed-column approach (Column E / index 4), which was wrong: in the current
+    files Column E is PRIMARY_DISCLOSURE_LANG, not a Series ID.
+  - Series-sheet population now uses two gates:
+        Gate 1 — the section's Series ID for the row must be non-blank;
+        Gate 2 — at least one DATA column belonging to that section must be
+                 non-blank (stops rows that carry only a Series ID, e.g.
+                 directors with no committee data, from being written).
+  - Scalar DVV override writes directly to the single issuer row (row 2),
+    matched by DATALIB_TAG only — no Series ID matching.
+  - Series-sheet DVV override matches on serial_id + DATALIB_TAG and, when no
+    matching row exists, CREATES A NEW ROW (issuer id + serial id + value,
+    green-highlighted) instead of logging an exception.
 
-Changes in 5.3.0
-  - Series-ID handling upgraded to the v13.0.0 command-line logic, KEEPING the
-    v5.2.0 interface and bundled templates unchanged:
-      * The extraction CSV has multiple "Series ID" columns (one per section).
-        Each data lib now resolves to the Series ID of the section it belongs
-        to, via build_datalib_to_series_map() — instead of a single fixed
-        Column E. (Column E in the current export is PRIMARY_DISCLOSURE_LANG,
-        i.e. 'English' — NOT a Series ID.)
-      * Series sheets now apply two gates before writing a row: (1) the
-        section's Series ID must be non-blank, and (2) at least one of that
-        section's data columns must be non-blank. This stops empty/partial
-        rows (e.g. directors with no committee data) from being written.
-      * serial_id written to each series row is the section Series ID, so it
-        lines up with the DVV SERIALID used for override matching.
-    The scalar sheet, DVV header-name matching, audit trail, multi-issuer
-    handling, ZIP output and UI are all exactly as in 5.2.0.
-
-Changes in 5.2.0
-  - DVV rows are now filtered in two stages before any override is applied:
-      1. keep only rows with a non-blank CORRECT_VALUE;
-      2. drop rows whose TAB is Individual, Director Data - Board,
-         Director Attributes, or Positions (CONFIG["DVV_EXCLUDED_TABS"]).
-  - Override routing is driven by the DVV Series ID: blank Series ID -> scalar
-    sheet, matched by DATALIB_TAG only; non-blank Series ID -> series sheets,
-    matched by serial_id + DATALIB_TAG. Blank-Series rows no longer raise a
-    "Blank DVV Series ID" exception (they are valid scalar corrections).
-
-Changes in 5.1.0
-  - DVV columns are now matched by HEADER NAME (DATALIB_TAG / CORRECT_VALUE /
-    SERIALID) instead of fixed Excel column letters (F / AG / AL). A new
-    'UUID4' column inserted at position A in the DVV export shifted every
-    column by one and broke letter-based matching; header matching is robust
-    to such insertions/removals. Matching is case-insensitive and
-    whitespace-tolerant, and raises a clear error if a header is missing.
+Retained from the earlier Streamlit build
+  - DVV columns are matched by HEADER NAME (DATALIB_TAG / CORRECT_VALUE /
+    SERIALID / TAB), not fixed Excel column letters, so a 'UUID4' column
+    inserted at position A (which shifted every column right by one) does not
+    break matching. Matching is case-insensitive and whitespace-tolerant.
+  - DVV rows are filtered in two stages: keep non-blank CORRECT_VALUE, then
+    drop rows whose TAB is Individual / Director Data - Board /
+    Director Attributes / Positions.
 
 What this app does
   Upload the extraction CSV and the DVV merged file, press Run, and download
   the populated bulk-upload templates as a ZIP.
 
-Key v5 behaviour (preserved from the command-line script)
+Key behaviour (preserved)
   - THREE fixed templates. Scalar and Series 1 are combined into one file.
   - The scalar (issuer-level) sheet is detected by SHEET NAME ("Scalar"),
     not by file. Every other sheet is series-level (one row per CSV row).
@@ -79,7 +55,7 @@ Web-app specifics
   - Everything is handled in memory (BytesIO); nothing is written to disk.
   - Validation issues and the DVV audit trail are shown on-screen and offered
     as optional CSV downloads (they are intentionally NOT inside the ZIP, to
-    match v5's "three files only" output).
+    match the "three files only" output).
 Requirements: streamlit | pandas | openpyxl
 ================================================================================
 """
@@ -161,11 +137,12 @@ CONFIG = {
         "Positions",
     },
 
-    # Series ID column index (0-based) used only for a confirmation log line.
-    # The ACTUAL per-section Series ID resolution is done dynamically by
-    # build_datalib_to_series_map() (the CSV has several "Series ID" columns,
-    # one per section). Column AD (index 29) is the primary 'Series ID' column;
-    # Column E (index 4) is PRIMARY_DISCLOSURE_LANG ('English'), NOT a Series ID.
+    # ── Extraction Series ID ──────────────────────────────────────────────────
+    # The extraction CSV has MULTIPLE "Series ID" columns (one per section).
+    # Series IDs are resolved per data-lib via build_datalib_to_series_map(),
+    # NOT from a single fixed column. The index below is only a fallback /
+    # diagnostic hint used when logging; it is no longer the source of truth.
+    # (In the current files Column E / index 4 is PRIMARY_DISCLOSURE_LANG.)
     "EXTRACTION_SERIES_COL_INDEX": 29,
 
     # Field names.
@@ -253,6 +230,9 @@ def standardize_header(raw_header: str) -> str:
         Audit Board Member (REL_AUDIT_BOARD)  ->  REL_AUDIT_BOARD
 
     Rule: extract text inside the LAST pair of parentheses; otherwise unchanged.
+    "Series ID" (and pandas' duplicate suffixes 'Series ID.1', …) have no
+    parentheses, so they pass through unchanged and remain detectable as the
+    section markers used by build_datalib_to_series_map().
     """
     raw = str(raw_header).strip()
     match = re.search(r"\(([^)]+)\)\s*$", raw)
@@ -266,6 +246,10 @@ def load_extraction(file_bytes: bytes, display_name: str,
     """
     Load extraction CSV (from uploaded bytes) and standardise headers.
     All values read as strings to prevent type inference. No column reordering.
+
+    The raw CSV carries several "Series ID" columns (one per section). pandas
+    auto-suffixes duplicates as 'Series ID.1', 'Series ID.2', … — these are
+    preserved here and consumed later by build_datalib_to_series_map().
     """
     logger.info(f"Loading extraction CSV: {display_name}")
     try:
@@ -278,13 +262,20 @@ def load_extraction(file_bytes: bytes, display_name: str,
 
     df.columns = [standardize_header(c) for c in df.columns]
 
-    idx = CONFIG["EXTRACTION_SERIES_COL_INDEX"]
-    if len(df.columns) > idx:
-        logger.info(f"Series ID column (index {idx}) = '{df.columns[idx]}'")
+    # Report the Series ID columns that were found (diagnostic only).
+    series_cols = [
+        c for c in df.columns
+        if c == "Series ID" or re.match(r"^Series ID(\.\d+)?$", c)
+    ]
+    if series_cols:
+        logger.info(
+            f"Found {len(series_cols)} Series ID column(s): "
+            f"{', '.join(series_cols)}"
+        )
     else:
         logger.warning(
-            f"Extraction CSV has fewer than {idx + 1} columns - "
-            "the Series ID column cannot be read."
+            "No 'Series ID' column found in the extraction CSV. "
+            "Series sheets will be left empty (no Series ID to match)."
         )
 
     logger.info(
@@ -294,16 +285,17 @@ def load_extraction(file_bytes: bytes, display_name: str,
     return df
 
 
-def build_datalib_to_series_map(ext_df: pd.DataFrame) -> dict:
+def build_datalib_to_series_map(ext_df: pd.DataFrame) -> dict[str, int]:
     """
-    Map datalib_code -> Series ID column index (0-based) in ext_df.
+    Build a mapping: datalib_code -> Series ID column index in ext_df.
 
-    The extraction CSV has multiple 'Series ID' columns (one per section);
-    each precedes its section's data columns. The correct Series ID for any
-    data lib is the nearest 'Series ID' column positioned BEFORE that code's
-    column.
+    The extraction CSV has multiple 'Series ID' columns (one per section).
+    Each Series ID column immediately precedes the data-lib columns for that
+    section. For any given data-lib code, the correct Series ID is the one
+    whose column position is the closest one BEFORE that code's column.
 
-    Returns e.g. { 'BDMTGS': 197, 'COMMITTEENAME': 205, ... }.
+    Returns e.g. { 'DIRGENDER': 7, 'COMMITTEENAME': 10, ... } where values are
+    0-based column indices into ext_df.
     """
     cols = list(ext_df.columns)
     series_id_positions = [
@@ -311,30 +303,15 @@ def build_datalib_to_series_map(ext_df: pd.DataFrame) -> dict:
         if c == "Series ID" or re.match(r"^Series ID(\.\d+)?$", c)
     ]
 
-    datalib_to_series_col: dict = {}
+    datalib_to_series_col: dict[str, int] = {}
     for col_idx, col_name in enumerate(cols):
-        if col_name in ("Series ID",) or re.match(r"^Series ID(\.\d+)?$", col_name):
+        if col_name == "Series ID" or re.match(r"^Series ID(\.\d+)?$", col_name):
             continue
         before = [p for p in series_id_positions if p < col_idx]
         if before:
             datalib_to_series_col[col_name] = before[-1]
 
     return datalib_to_series_col
-
-
-def get_series_id_for_datalib(ext_row: pd.Series, ext_df: pd.DataFrame,
-                              datalib_code: str,
-                              datalib_to_series_map: dict) -> str | None:
-    """Return the Series ID value for a specific data lib code in a row,
-    using that code's section-level Series ID column."""
-    series_col_idx = datalib_to_series_map.get(datalib_code)
-    if series_col_idx is None:
-        return None
-    col_name = ext_df.columns[series_col_idx]
-    val = ext_row.get(col_name)
-    if pd.notna(val) and str(val).strip() not in ("", "nan"):
-        return str(val).strip()
-    return None
 
 
 def row_has_data(ext_row: pd.Series, template_headers: list[str]) -> bool:
@@ -379,8 +356,9 @@ def load_dvv(file_bytes: bytes, display_name: str,
     Load DVV Merged XLSX (from uploaded bytes) and return the rows to apply.
 
     Columns are matched by HEADER NAME (row 1), not fixed Excel column letters,
-    so the function is robust to columns being inserted/removed upstream.
-    Matching is case-insensitive and whitespace-tolerant.
+    so the function is robust to columns being inserted/removed upstream
+    (e.g. the 'UUID4' column added at position A). Matching is case-insensitive
+    and whitespace-tolerant.
 
     Two filters are applied, in this order:
       1. Keep only rows where CORRECT_VALUE is non-blank.
@@ -491,9 +469,17 @@ def populate_template(
 
     Scalar sheet (sheet named CONFIG["SCALAR_SHEET_NAME"]):
         one issuer-level row, no Series ID, no blank-row check.
-    Every other sheet:
-        one output row per extraction row, Series ID from Column E,
-        rows where all template data fields are blank are skipped.
+
+    Every other sheet (series-level) uses two gates per extraction row:
+        Gate 1 — the section's Series ID for the row must be non-blank;
+        Gate 2 — at least one DATA column belonging to that section must be
+                 non-blank. This stops rows that carry only a Series ID (e.g.
+                 a director with no committee data) from being written.
+
+    Each series sheet finds its OWN section: the Series ID column nearest-before
+    the sheet's data-lib headers, and the data columns between that Series ID
+    column and the next one. Section membership comes from
+    build_datalib_to_series_map().
 
     The scalar sheet is detected by NAME, so it works whether it lives in its
     own file or is combined with series sheets (the Scalar & Series 1 file).
@@ -506,6 +492,11 @@ def populate_template(
 
     # Build once: datalib_code -> which Series ID column index to use.
     datalib_to_series_map = build_datalib_to_series_map(ext_df)
+    all_std = list(ext_df.columns)
+    series_positions = [
+        i for i, c in enumerate(all_std)
+        if c == "Series ID" or re.match(r"^Series ID(\.\d+)?$", c)
+    ]
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -544,6 +535,13 @@ def populate_template(
                     f"  No rows for issuer {issuer_id}. "
                     f"Scalar sheet '{sheet_name}' left empty."
                 )
+                # Still record meta so downstream steps are consistent.
+                sheet_meta[sheet_name] = {
+                    "headers":        headers,
+                    "header_col_map": header_col_map,
+                    "data_start_row": data_start_row,
+                    "populated_rows": 0,
+                }
                 continue
 
             ext_row   = issuer_rows.iloc[0]
@@ -563,13 +561,9 @@ def populate_template(
 
         # -- POSITION / SERIES: one row per extraction row ---------------------
         else:
-            # Find the Series ID column for this sheet and the range of data
-            # columns that belong to its section. A row is written only if the
-            # section Series ID is non-blank AND at least one section data
-            # column is non-blank.
+            # Find the Series ID column for this sheet (nearest-before the
+            # sheet's data-lib headers) and the data columns in its section.
             sheet_series_col_idx = None
-            sheet_section_cols   = []   # standardised data col names for this section
-
             for h in headers:
                 if h in (CONFIG["ISSUER_ID_FIELD"], "serial_id"):
                     continue
@@ -577,12 +571,8 @@ def populate_template(
                 if idx is not None and sheet_series_col_idx is None:
                     sheet_series_col_idx = idx
 
+            sheet_section_cols: list[str] = []
             if sheet_series_col_idx is not None:
-                all_std = list(ext_df.columns)
-                series_positions = [
-                    i for i, c in enumerate(all_std)
-                    if c == "Series ID" or re.match(r"^Series ID(\.\d+)?$", c)
-                ]
                 next_series = next(
                     (p for p in series_positions if p > sheet_series_col_idx),
                     len(all_std)
@@ -605,13 +595,12 @@ def populate_template(
                 else:
                     section_series_id = None
 
-                # Gate 2: at least one section DATA column must be non-blank
-                # (prevents writing rows that only carry a Series ID, e.g.
-                # directors with no committee-membership data).
+                # Gate 2: at least one DATA column in this section must be
+                # non-blank (prevents rows that only have a Series ID).
                 if sheet_section_cols:
                     section_has_data = any(
-                        pd.notna(ext_row.get(c)) and
-                        str(ext_row.get(c, "")).strip() not in ("", "nan")
+                        pd.notna(ext_row.get(c))
+                        and str(ext_row.get(c, "")).strip() not in ("", "nan")
                         for c in sheet_section_cols
                     )
                     if not section_has_data:
@@ -661,21 +650,24 @@ def apply_dvv_overrides(
     """
     Apply DVV Correct Value overrides to the populated workbook.
 
-    Routing aligned with the command-line v13 logic. Per DVV row (Correct Value
-    already non-blank and excluded TABs already dropped in load_dvv):
-      1. Skip if DATALIB_TAG is not a column header on the sheet.
-      2. Scalar sheet (CONFIG["SCALAR_SHEET_NAME"]): write CORRECT_VALUE to the
-         single issuer row (row 2) + green. No Series ID match required — any
-         DATALIB_TAG that is a scalar header is applied.
-      3. Series sheets (every other sheet): only DVV rows that CARRY a Series ID
-         are applied, matched on serial_id == SERIALID:
-           - row found     -> overwrite that cell + green;
-           - row not found -> CREATE a new row (DMX_ISSUER_ID + serial_id + the
-             value, green-highlighted).
-         DVV rows with a BLANK Series ID are skipped on series sheets.
+    Routing is driven by the DVV row's Series ID:
+      - Scalar sheet (named CONFIG["SCALAR_SHEET_NAME"]): only DVV rows with a
+        BLANK Series ID are applied, matched by DATALIB_TAG. The value is
+        written directly to the single issuer row (data_start_row). DVV rows
+        that carry a Series ID are series-level corrections and are skipped on
+        the scalar sheet.
+      - Series sheets: only DVV rows WITH a Series ID are applied, matched on
+        serial_id + DATALIB_TAG.
+            * Match found     -> overwrite that cell + green highlight.
+            * No match found  -> CREATE A NEW ROW (issuer id + serial id +
+                                 value, green) and record it. (v13 behaviour;
+                                 replaces the old "log an exception" path.)
 
-    Updated cells are highlighted with DVV_HIGHLIGHT_COLOR. Returns audit records
-    for the on-screen DVV audit trail.
+    (The dvv_df passed in has already been filtered to non-blank Correct Values
+    with the excluded TABs removed — see load_dvv.)
+
+    Updated/added cells are highlighted with DVV_HIGHLIGHT_COLOR.
+    Returns audit records (one per applied change or created row).
     """
     dvv_fill = PatternFill(
         "solid",
@@ -699,35 +691,39 @@ def apply_dvv_overrides(
         issuer_id_col = header_col_map.get(CONFIG["ISSUER_ID_FIELD"])
 
         # Build serial_id -> excel row number map from existing rows
-        # (series sheets only; the scalar sheet needs no row matching).
+        # (series sheets only; scalar has no Series ID matching).
         row_map: dict[str, int] = {}
         if not is_scalar and serial_id_col:
-            for r in range(data_start_row, data_start_row + meta["populated_rows"]):
+            for r in range(data_start_row,
+                           data_start_row + meta["populated_rows"]):
                 sid = ws.cell(row=r, column=serial_id_col).value
-                if sid is not None:
+                if sid is not None and str(sid).strip() not in ("", "nan"):
                     row_map[str(sid).strip()] = r
 
         for _, dvv_row in dvv_df.iterrows():
             datalib     = str(dvv_row.get("_DVV_DATALIB", "")).strip()
             correct_val = dvv_row.get("_DVV_CORRECT_VALUE")
 
-            # Normalise the DVV Series ID; treat NaN / "nan" / "none" / "" as blank.
+            # Normalise the DVV Series ID; treat NaN / "nan" / "" all as blank.
             raw_series = dvv_row.get("_DVV_SERIES_ID")
             dvv_series = (
                 "" if (pd.isna(raw_series)
-                       or str(raw_series).strip().lower() in ("", "nan", "none"))
+                       or str(raw_series).strip().lower() in ("", "nan"))
                 else str(raw_series).strip()
             )
 
-            # Skip if DATALIB_TAG is not a header on this sheet.
+            # Skip if DATALIB_TAG is not a header in this sheet.
             if not datalib or datalib not in header_col_map:
                 continue
 
             target_col = header_col_map[datalib]
 
+            # ── SCALAR: blank-Series rows only, write to the issuer row ───────
             if is_scalar:
-                # ── Scalar: write directly to the single issuer row (row 2) ──
-                cell      = ws.cell(row=data_start_row, column=target_col)
+                if dvv_series:
+                    # Series-level correction — does not belong on scalar sheet.
+                    continue
+                cell = ws.cell(row=data_start_row, column=target_col)
                 old_value = cell.value
                 cell.value = correct_val
                 cell.fill  = dvv_fill
@@ -739,54 +735,57 @@ def apply_dvv_overrides(
                     "Template Name": template_key, "Worksheet Name": sheet_name,
                     "Status": "SUCCESS",
                 })
-
-            elif dvv_series and serial_id_col:
-                # ── Series-level: match by Series ID ─────────────────────────
-                if dvv_series in row_map:
-                    row_num   = row_map[dvv_series]
-                    cell      = ws.cell(row=row_num, column=target_col)
-                    old_value = cell.value
-                    cell.value = correct_val
-                    cell.fill  = dvv_fill
-                    audit_recs.append({
-                        "Issuer ID": issuer_id, "Series ID": dvv_series,
-                        "Data Lib": datalib,
-                        "Old Value": str(old_value) if old_value is not None else "",
-                        "New Value": str(correct_val), "Update Timestamp": ts,
-                        "Template Name": template_key, "Worksheet Name": sheet_name,
-                        "Status": "SUCCESS",
-                    })
-                else:
-                    # Row NOT found -> create a NEW row (v13 behaviour).
-                    new_row = data_start_row + meta["populated_rows"]
-                    if issuer_id_col:
-                        ws.cell(row=new_row, column=issuer_id_col).value = issuer_id
-                    ws.cell(row=new_row, column=serial_id_col).value = dvv_series
-                    cell = ws.cell(row=new_row, column=target_col)
-                    cell.value = correct_val
-                    cell.fill  = dvv_fill
-                    row_map[dvv_series] = new_row
-                    meta["populated_rows"] += 1
-                    logger.info(
-                        f"  DVV new row: sheet='{sheet_name}' "
-                        f"SeriesID={dvv_series} DataLib={datalib}"
-                    )
-                    audit_recs.append({
-                        "Issuer ID": issuer_id, "Series ID": dvv_series,
-                        "Data Lib": datalib, "Old Value": "",
-                        "New Value": str(correct_val), "Update Timestamp": ts,
-                        "Template Name": template_key, "Worksheet Name": sheet_name,
-                        "Status": "SUCCESS (new row created)",
-                    })
-            else:
-                # No Series ID and not the scalar sheet -> skip entirely.
                 continue
 
-    success  = sum(1 for r in audit_recs if r["Status"].startswith("SUCCESS"))
+            # ── SERIES: needs a Series ID and a serial_id column ──────────────
+            if not dvv_series or not serial_id_col:
+                # No Series ID (and not scalar), or sheet has no serial_id
+                # column to match against — skip.
+                continue
+
+            if dvv_series in row_map:
+                # Match found -> overwrite in place.
+                row_num   = row_map[dvv_series]
+                cell      = ws.cell(row=row_num, column=target_col)
+                old_value = cell.value
+                cell.value = correct_val
+                cell.fill  = dvv_fill
+                audit_recs.append({
+                    "Issuer ID": issuer_id, "Series ID": dvv_series,
+                    "Data Lib": datalib,
+                    "Old Value": str(old_value) if old_value is not None else "",
+                    "New Value": str(correct_val), "Update Timestamp": ts,
+                    "Template Name": template_key, "Worksheet Name": sheet_name,
+                    "Status": "SUCCESS",
+                })
+            else:
+                # No matching row -> CREATE A NEW ROW (v13 behaviour).
+                new_row = data_start_row + meta["populated_rows"]
+                if issuer_id_col:
+                    ws.cell(row=new_row, column=issuer_id_col).value = issuer_id
+                ws.cell(row=new_row, column=serial_id_col).value = dvv_series
+                cell = ws.cell(row=new_row, column=target_col)
+                cell.value = correct_val
+                cell.fill  = dvv_fill
+                row_map[dvv_series] = new_row
+                meta["populated_rows"] += 1
+                logger.info(
+                    f"  DVV new row: sheet='{sheet_name}' "
+                    f"SeriesID={dvv_series} DataLib={datalib}"
+                )
+                audit_recs.append({
+                    "Issuer ID": issuer_id, "Series ID": dvv_series,
+                    "Data Lib": datalib, "Old Value": "",
+                    "New Value": str(correct_val), "Update Timestamp": ts,
+                    "Template Name": template_key, "Worksheet Name": sheet_name,
+                    "Status": "SUCCESS (new row created)",
+                })
+
+    success = sum(1 for r in audit_recs if r["Status"].startswith("SUCCESS"))
     new_rows = sum(1 for r in audit_recs if "new row" in r["Status"])
     logger.info(
-        f"DVV overrides '{template_key}': {success} change(s)"
-        + (f" ({new_rows} new row(s) created)" if new_rows else "")
+        f"DVV overrides '{template_key}': {success} change(s) "
+        f"({new_rows} via new rows)"
     )
     return audit_recs
 
@@ -828,6 +827,9 @@ def format_worksheet(
     """
     Header styling, data borders, AutoFilter, freeze top row, auto-fit columns.
     DVV green highlights are preserved (the data loop sets font/border only).
+
+    NOTE: populated_rows is read from sheet_meta AFTER apply_dvv_overrides, so
+    any rows the DVV step added are included in the formatted range.
 
     AutoFilter is used instead of Excel Table objects: openpyxl emits orphaned
     table XML that Excel must repair on open ("We found a problem"). AutoFilter
@@ -888,10 +890,16 @@ def build_validation_log(
     logger: logging.Logger,
 ) -> list[dict]:
     """Validation records: template Data Libs missing in extraction, and
-    extraction Data Libs unused in any template."""
+    extraction Data Libs unused in any template.
+
+    'Series ID' marker columns (and their pandas suffixes) are not real data
+    libs, so they are excluded from the 'unused extraction column' check."""
     ext_cols      = set(ext_df.columns.tolist())
     all_tmpl_cols: set[str] = set()
     records = []
+
+    def is_series_marker(name: str) -> bool:
+        return name == "Series ID" or bool(re.match(r"^Series ID(\.\d+)?$", name))
 
     for tmpl_key, sheets in all_template_headers.items():
         for sheet_name, headers in sheets.items():
@@ -909,7 +917,9 @@ def build_validation_log(
                     })
 
     for col in ext_cols:
-        if col not in all_tmpl_cols and col not in {CONFIG["ISSUER_ID_FIELD"], "serial_id"}:
+        if (col not in all_tmpl_cols
+                and col not in {CONFIG["ISSUER_ID_FIELD"], "serial_id"}
+                and not is_series_marker(col)):
             records.append({
                 "Check Type": "Extraction DataLib unused in Templates",
                 "Template": "ALL", "Sheet": "ALL", "Data Lib": col,
@@ -941,7 +951,7 @@ def process_one_issuer(
     """
     Run the pipeline for a single issuer.
     Returns (output_files, summary, audit_records, validation_records).
-    Output files are ONLY the populated templates (v5 behaviour).
+    Output files are ONLY the populated templates.
     """
     outputs: list[tuple[str, bytes]] = []
     all_template_headers: dict[str, dict[str, list]] = {}
@@ -979,7 +989,7 @@ def process_one_issuer(
             )
             all_audit_records.extend(audit_recs)
             total_dvv_overrides += sum(
-                1 for r in audit_recs if r["Status"] == "SUCCESS"
+                1 for r in audit_recs if r["Status"].startswith("SUCCESS")
             )
         except Exception as e:
             msg = f"DVV override failed for '{tmpl_key}': {e}"
@@ -1011,13 +1021,6 @@ def process_one_issuer(
     val_records = build_validation_log(
         all_template_headers, issuer_ext_df, issuer_id, logger
     )
-    for rec in all_audit_records:
-        if "EXCEPTION" in rec.get("Status", ""):
-            val_records.append({
-                "Check Type": "DVV Override Exception",
-                "Template": rec["Template Name"], "Sheet": rec["Worksheet Name"],
-                "Data Lib": rec["Data Lib"], "Detail": rec["Status"],
-            })
 
     summary = {
         "Issuer ID": issuer_id,
